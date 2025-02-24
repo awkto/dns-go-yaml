@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/miekg/dns"
 	"gopkg.in/ini.v1" // Import the ini package for reading .ini files
@@ -26,6 +28,11 @@ type Config struct {
 	Records []Record `yaml:"records"`
 }
 
+type CacheEntry struct {
+	Records []dns.RR
+	Expiry  time.Time
+}
+
 var dnsRecords map[string][]dns.RR
 var port string
 var forwarder string
@@ -34,6 +41,12 @@ var queryLogFile string
 var queryLog *os.File
 var enableForwarding bool
 var zoneFileFormat string
+var dnsCache map[string]CacheEntry
+var cacheMutex sync.RWMutex
+
+func init() {
+	dnsCache = make(map[string]CacheEntry)
+}
 
 func loadConfig(filename string) error {
 	cfg, err := ini.Load(filename)
@@ -228,36 +241,80 @@ func handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		queryName = strings.ToLower(queryName) // Convert query name to lowercase
 		log.Printf("Received query for: %s", question.Name)
 
-		records, ok := dnsRecords[queryName] // Use lowercase query name
-		if ok {
-			log.Printf("Found local records for %s", question.Name)
-			if len(records) > 0 {
-				log.Printf("Responding with local records")
-				m.Answer = append(m.Answer, records...)
-				logQuery(question.Name, "Authoritative response")
-			} else {
-				log.Printf("No records found for %s, but key exists", question.Name)
-			}
+		// Check cache first
+		cacheMutex.RLock()
+		cacheEntry, ok := dnsCache[queryName]
+		cacheMutex.RUnlock()
+
+		if ok && time.Now().Before(cacheEntry.Expiry) {
+			log.Printf("Cache hit for %s, TTL: %s", question.Name, time.Until(cacheEntry.Expiry).String())
+			m.Answer = append(m.Answer, cacheEntry.Records...)
+			logQuery(question.Name, "Cache response")
 		} else {
-			log.Printf("No local records found for %s", question.Name)
-			// If no records found, forward to the upstream DNS server if forwarding is enabled
-			if enableForwarding && forwarder != "" {
-				c := new(dns.Client)
-				resp, _, err := c.Exchange(r, forwarder+":53")
-				if err == nil {
-					// Forward the response from the upstream server
-					resp.CopyTo(m) // Copy the response to the message
-					m.SetReply(r)  // Ensure the message is a reply
-					w.WriteMsg(m)
-					logQuery(question.Name, "Forwarded response")
-					return
-				} else {
-					log.Printf("Error forwarding request: %v", err)
-				}
+			if ok {
+				log.Printf("Cache expired for %s", question.Name)
+				// Delete expired cache entry
+				cacheMutex.Lock()
+				delete(dnsCache, queryName)
+				cacheMutex.Unlock()
 			}
-			// If no records found and no forwarding occurred, respond with NXDOMAIN
-			m.SetRcode(r, dns.RcodeNameError)
-			logQuery(question.Name, "NXDOMAIN response")
+
+			log.Printf("Cache miss for %s", question.Name)
+
+			records, ok := dnsRecords[queryName] // Use lowercase query name
+			if ok {
+				log.Printf("Found local records for %s", question.Name)
+				if len(records) > 0 {
+					log.Printf("Responding with local records")
+					m.Answer = append(m.Answer, records...)
+					logQuery(question.Name, "Authoritative response")
+
+					// Add to cache
+					cacheMutex.Lock()
+					expiry := time.Now().Add(time.Duration(records[0].Header().Ttl) * time.Second)
+					dnsCache[queryName] = CacheEntry{
+						Records: records,
+						Expiry:  expiry,
+					}
+					cacheMutex.Unlock()
+					log.Printf("Added %s to cache, TTL: %s", question.Name, time.Until(expiry).String())
+
+				} else {
+					log.Printf("No records found for %s, but key exists", question.Name)
+				}
+			} else {
+				log.Printf("No local records found for %s", question.Name)
+				// If no records found, forward to the upstream DNS server if forwarding is enabled
+				if enableForwarding && forwarder != "" {
+					c := new(dns.Client)
+					resp, _, err := c.Exchange(r, forwarder+":53")
+					if err == nil {
+						// Forward the response from the upstream server
+						resp.CopyTo(m) // Copy the response to the message
+						m.SetReply(r)  // Ensure the message is a reply
+						w.WriteMsg(m)
+						logQuery(question.Name, "Forwarded response")
+
+						// Add to cache
+						if len(resp.Answer) > 0 {
+							cacheMutex.Lock()
+							expiry := time.Now().Add(time.Duration(resp.Answer[0].Header().Ttl) * time.Second)
+							dnsCache[queryName] = CacheEntry{
+								Records: resp.Answer,
+								Expiry:  expiry,
+							}
+							cacheMutex.Unlock()
+							log.Printf("Added %s to cache, TTL: %s", question.Name, time.Until(expiry).String())
+						}
+						return
+					} else {
+						log.Printf("Error forwarding request: %v", err)
+					}
+				}
+				// If no records found and no forwarding occurred, respond with NXDOMAIN
+				m.SetRcode(r, dns.RcodeNameError)
+				logQuery(question.Name, "NXDOMAIN response")
+			}
 		}
 	}
 
