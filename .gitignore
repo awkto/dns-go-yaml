@@ -1,0 +1,16 @@
+# Ignore binary files
+/bin/
+/*.exe
+/*.out
+
+# Ignore IDE/editor specific files
+*.idea/
+*.vscode/
+*.swp
+
+# Ignore test coverage files
+*.out
+*.cover
+
+# Ignore vendor directory if you are not using vendoring
+/vendor/
