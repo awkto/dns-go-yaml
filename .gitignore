@@ -14,3 +14,6 @@
 
 # Ignore vendor directory if you are not using vendoring
 /vendor/
+
+# Logs
+query.log

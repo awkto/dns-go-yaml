@@ -1,0 +1,5 @@
+name,type,ttl,data
+example.com,A,600,192.0.2.1
+www.example.com,CNAME,600,example.com
+site1.example.com,A,300,10.0.0.5
+site2.example.com,A,300,12.34.56.78
